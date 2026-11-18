@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 G0 = 9.80665          # m/s^2, standard gravity (used only in the rocket equation)
 C_LIGHT = 299_792_458.0
@@ -395,6 +395,70 @@ def simulate_landing(body: Body, lander: Lander, s0: State,
         if s.fuel > 0:
             peak_a = max(peak_a, throttle * lander.thrust_max / m)
         advance(s, body, lander, throttle, ux, uy, dt)
+        steps += 1
+
+
+def simulate_player_landing(body: Body, lander: Lander, s0: State,
+                            control_source: Callable[[State], PlayerControl],
+                            dt: float = 0.1,
+                            crit: Optional[Criteria] = None,
+                            t_max: Optional[float] = None,
+                            log_every: Optional[float] = None) -> Result:
+    """Run a landing with fresh player input each step; the callback receives a state snapshot."""
+    if not math.isfinite(dt) or dt <= 0.0:
+        raise ValueError("dt must be a positive finite number")
+    if t_max is not None and (not math.isfinite(t_max) or t_max <= 0.0):
+        raise ValueError("t_max must be a positive finite number")
+
+    crit = crit or Criteria.for_body(body)
+    s = State(s0.x, s0.y, s0.vx, s0.vy, s0.fuel, s0.t)
+    r0 = math.hypot(s.x, s.y)
+    t_max = t_max or 20.0 * body.dynamical_time(r0)
+    m_start = lander.empty_mass + s.fuel
+    v0 = math.hypot(s.vx, s.vy)
+    log, next_log, steps = [], 0.0, 0
+    peak_a = 0.0
+
+    while True:
+        r = math.hypot(s.x, s.y)
+        h = r - body.radius
+        vr = (s.vx * s.x + s.vy * s.y) / r
+        vh = (-s.vx * s.y + s.vy * s.x) / r
+        m = lander.empty_mass + s.fuel
+        dv_used = tsiolkovsky_dv(lander.isp, m_start, m)
+
+        if log_every and s.t >= next_log:
+            log.append((s.t, h, vr, vh, s.fuel))
+            next_log += log_every
+
+        if h <= 0.0:
+            vv, vhh = -vr, abs(vh)
+            if vv <= crit.max_vertical and vhh <= crit.max_horizontal:
+                outcome, reason = "LANDED", "within limits"
+            else:
+                bad = []
+                if vv > crit.max_vertical:
+                    bad.append(f"vertical {vv:.2f} > {crit.max_vertical:.2f}")
+                if vhh > crit.max_horizontal:
+                    bad.append(f"horizontal {vhh:.2f} > {crit.max_horizontal:.2f}")
+                outcome, reason = "CRASHED", "; ".join(bad)
+                if s.fuel <= 0:
+                    reason += " (out of fuel)"
+            return Result(outcome, reason, s.t, vv, vhh, s.fuel, dv_used, v0,
+                          steps, log, peak_g=peak_a / G0)
+        if s.t >= t_max:
+            return Result("TIMEOUT", "never reached surface", s.t, -vr, abs(vh),
+                          s.fuel, dv_used, v0, steps, log, peak_g=peak_a / G0)
+
+        snapshot = State(s.x, s.y, s.vx, s.vy, s.fuel, s.t)
+        control = control_source(snapshot)
+        if not isinstance(control, PlayerControl):
+            raise TypeError("control_source must return a PlayerControl")
+        step = min(dt, t_max - s.t)
+        throttle = control.throttle if s.fuel > 0 else 0.0
+        if s.fuel > 0:
+            peak_a = max(peak_a, throttle * lander.thrust_max / m)
+        advance_controlled(s, body, lander, control, step)
         steps += 1
 
 
