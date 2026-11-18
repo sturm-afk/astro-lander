@@ -78,6 +78,43 @@ def test_burn_matches_tsiolkovsky_in_free_space():
     assert s.fuel == pytest.approx(0.0, abs=1e-9)
 
 
+def test_player_control_steers_from_current_velocity():
+    s = State(10.0, 0.0, 3.0, 4.0, 1.0)
+    assert PlayerControl(0.5).command(s) == pytest.approx((0.5, 0.6, 0.8))
+    assert PlayerControl(1.0, math.pi).command(s) == pytest.approx((1.0, -0.6, -0.8))
+
+
+def test_player_control_falls_back_to_local_tangent_at_rest():
+    s = State(0.0, 10.0, 0.0, 0.0, 1.0)
+    assert PlayerControl().command(s) == pytest.approx((0.0, -1.0, 0.0))
+
+
+def test_advance_controlled_applies_throttle_and_burns_fuel():
+    deep = Body("deep space", 1e-9, 1.0)
+    L = Lander(100.0, 10.0, 100.0, 300.0)
+    s = State(1e7, 0.0, 0.0, 10.0, L.fuel_mass)
+    advance_controlled(s, deep, L, PlayerControl(0.5), 1.0)
+    assert s.vy > 10.0
+    assert s.fuel == pytest.approx(10.0 - 0.5 * L.mdot_max)
+    assert s.t == 1.0
+
+
+@pytest.mark.parametrize("throttle", [-0.1, 1.1, math.inf, math.nan])
+def test_player_control_rejects_invalid_throttle(throttle):
+    with pytest.raises(ValueError):
+        PlayerControl(throttle)
+
+
+def test_player_control_rejects_nonfinite_angle():
+    with pytest.raises(ValueError):
+        PlayerControl(angle=math.inf)
+
+
+def test_player_control_requires_position_when_at_rest():
+    with pytest.raises(ValueError, match="body's center"):
+        PlayerControl().command(State(0.0, 0.0, 0.0, 0.0, 1.0))
+
+
 def test_calculators():
     assert tsiolkovsky_dv(300, 2000, 1000) == pytest.approx(300 * G0 * math.log(2))
     assert propellant_for_dv(300, 2000, tsiolkovsky_dv(300, 2000, 1000)) == pytest.approx(1000)

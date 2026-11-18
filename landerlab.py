@@ -197,6 +197,31 @@ class State:
     t: float = 0.0
 
 
+@dataclass(frozen=True)
+class PlayerControl:
+    """Manual engine command: throttle fraction and steering angle from prograde, in radians."""
+    throttle: float = 0.0
+    angle: float = 0.0
+
+    def __post_init__(self):
+        if not math.isfinite(self.throttle) or not 0.0 <= self.throttle <= 1.0:
+            raise ValueError("throttle must be between 0 and 1")
+        if not math.isfinite(self.angle):
+            raise ValueError("angle must be finite")
+
+    def command(self, s: State) -> tuple[float, float, float]:
+        speed = math.hypot(s.vx, s.vy)
+        if speed > 0.0:
+            px, py = s.vx / speed, s.vy / speed
+        else:
+            r = math.hypot(s.x, s.y)
+            if r == 0.0:
+                raise ValueError("cannot steer at the body's center")
+            px, py = -s.y / r, s.x / r
+        c, sn = math.cos(self.angle), math.sin(self.angle)
+        return self.throttle, c * px - sn * py, sn * px + c * py
+
+
 def state_at_periapsis(body: Body, lander: Lander, r_apo: float, r_peri: float) -> State:
     return State(r_peri, 0.0, 0.0, periapsis_speed(body, r_apo, r_peri), lander.fuel_mass)
 
@@ -227,6 +252,13 @@ def advance(s: State, body: Body, lander: Lander, throttle: float,
     s.vy += 0.5 * (a0y + gy1 + aty) * dt
     s.fuel -= dm
     s.t += dt
+
+
+def advance_controlled(s: State, body: Body, lander: Lander,
+                       control: PlayerControl, dt: float) -> None:
+    """Apply one player command; call again after inspecting the updated state."""
+    throttle, ux, uy = control.command(s)
+    advance(s, body, lander, throttle, ux, uy, dt)
 
 
 @dataclass
