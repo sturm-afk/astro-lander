@@ -99,6 +99,26 @@ def test_advance_controlled_applies_throttle_and_burns_fuel():
     assert s.t == 1.0
 
 
+@pytest.mark.parametrize(("time_scale", "expected_t"), [(0.5, 0.5), (1.0, 1.0), (3.0, 3.0)])
+def test_advance_controlled_scales_simulation_time(time_scale, expected_t):
+    deep = Body("deep space", 1e-9, 1.0)
+    L = Lander(100.0, 10.0, 100.0, 300.0)
+    s = State(1e7, 0.0, 0.0, 10.0, L.fuel_mass)
+
+    advance_controlled(s, deep, L, PlayerControl(time_scale=time_scale), 1.0)
+
+    assert s.t == expected_t
+
+
+def test_advance_controlled_rejects_unrepresentable_scaled_timestep():
+    L = Lander(100.0, 0.0, 100.0, 300.0)
+    s = State(1e7, 0.0, 0.0, 10.0, 0.0)
+
+    with pytest.raises(ValueError, match="scaled timestep"):
+        advance_controlled(s, Body("deep space", 1e-9, 1.0), L,
+                           PlayerControl(time_scale=1e308), 10.0)
+
+
 def test_simulate_player_landing_requests_fresh_controls_and_times_out():
     deep = Body("deep space", 1e-9, 1.0)
     L = Lander(100.0, 10.0, 100.0, 300.0)
@@ -117,6 +137,27 @@ def test_simulate_player_landing_requests_fresh_controls_and_times_out():
     assert observed[1][1] > observed[0][1]
     assert result.fuel_left == pytest.approx(10.0 - 0.75 * L.mdot_max)
     assert s0.t == 0.0 and s0.fuel == L.fuel_mass
+
+
+def test_simulate_player_landing_applies_control_time_scale_and_caps_timeout():
+    deep = Body("deep space", 1e-9, 1.0)
+    L = Lander(100.0, 10.0, 100.0, 300.0)
+    s0 = State(1e7, 0.0, 0.0, 10.0, L.fuel_mass)
+    observed_times = []
+    scales = iter((0.5, 3.0))
+
+    def control_source(state):
+        observed_times.append(state.t)
+        return PlayerControl(time_scale=next(scales))
+
+    result = simulate_player_landing(
+        deep, L, s0, control_source, dt=1.0, t_max=2.5,
+    )
+
+    assert result.outcome == "TIMEOUT"
+    assert result.steps == 2
+    assert result.t == pytest.approx(2.5)
+    assert observed_times == [0.0, 0.5]
 
 
 @pytest.mark.parametrize(("vx", "outcome"), [(0.0, "LANDED"), (-10.0, "CRASHED")])
@@ -149,6 +190,12 @@ def test_player_control_rejects_invalid_throttle(throttle):
 def test_player_control_rejects_nonfinite_angle():
     with pytest.raises(ValueError):
         PlayerControl(angle=math.inf)
+
+
+@pytest.mark.parametrize("time_scale", [0.0, -0.5, math.inf, math.nan])
+def test_player_control_rejects_invalid_time_scale(time_scale):
+    with pytest.raises(ValueError, match="time_scale"):
+        PlayerControl(time_scale=time_scale)
 
 
 def test_player_control_requires_position_when_at_rest():
