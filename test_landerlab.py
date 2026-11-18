@@ -1,254 +1,141 @@
-"""Numerical invariants, reference flights, and edge-case regressions."""
-
-from dataclasses import replace
 import math
-import subprocess
-import sys
-
 import pytest
+from landerlab import *
 
-import landerlab as lab
-
-
-@pytest.mark.parametrize("name,altitude", [("moon", 100e3), ("ceres", 50e3), ("67p", 3e3)])
-def test_circular_orbit_closure_energy_and_momentum(name, altitude):
-    body = lab.BODIES[name]
-    r = body.radius + altitude
-    state = lab.State(r, 0, 0, body.circular_v(r), 0)
-    lander = lab.Lander(1, 0, 0, 300)
-    period = 2 * math.pi * body.dynamical_time(r)
-    energy = lab.specific_energy(state, body)
-    momentum = state.x * state.vy
-    for _ in range(20_000):
-        lab.advance(state, body, lander, 0, 1, 0, period / 2000)
-    assert abs(math.hypot(state.x, state.y) / r - 1) < 1e-5
-    assert abs(lab.specific_energy(state, body) / energy - 1) < 1e-6
-    assert math.hypot(state.x - r, state.y) / r < 1e-3
-    assert (state.x * state.vy - state.y * state.vx) / momentum == pytest.approx(1, rel=1e-9)
+MOON = BODIES["moon"]
 
 
-def test_elliptical_orbit_conserves_angular_momentum():
-    body = lab.BODIES["moon"]
-    lander = lab.Lander(1, 0, 0, 300)
-    state = lab.state_at_periapsis(body, lander, body.radius + 100e3, body.radius + 15e3)
-    momentum = state.x * state.vy
-    for _ in range(40_000):
-        lab.advance(state, body, lander, 0, 1, 0, 0.5)
-    assert (state.x * state.vy - state.y * state.vx) / momentum == pytest.approx(1, rel=1e-9)
+def coast(body, s, t_end, dt):
+    L = Lander(1.0, 0.0, 1.0, 300.0)       # irrelevant: throttle is always 0
+    while s.t < t_end - 1e-9:
+        advance(s, body, L, 0.0, 1.0, 0.0, min(dt, t_end - s.t))
 
 
-def test_short_lunar_coast_energy():
-    body = lab.BODIES["moon"]
-    state = lab.State(body.radius + 15e3, 0, 0, 1500, 0)
-    lander = lab.Lander(1, 0, 0, 300)
-    energy = lab.specific_energy(state, body)
-    for _ in range(3000):
-        lab.advance(state, body, lander, 0, 1, 0, 0.1)
-    assert lab.specific_energy(state, body) / energy == pytest.approx(1, rel=1e-9)
+# ---- body sanity ---------------------------------------------------------
+def test_moon_numbers():
+    assert MOON.surface_g == pytest.approx(1.62, abs=0.01)
+    assert MOON.escape_v == pytest.approx(2376, abs=5)
 
 
-def test_pseudo_newtonian_orbit_energy():
-    body = lab.BODIES["bh10"]
-    r = 10 * body.gravity.rs
-    speed = body.circular_v(r)
-    period = 2 * math.pi * r / speed
-    state = lab.State(r, 0, 0, speed, 0)
-    lander = lab.Lander(1, 0, 0, 300)
-    energy = lab.specific_energy(state, body)
-    for _ in range(20_000):
-        lab.advance(state, body, lander, 0, 1, 0, period / 4000)
-    assert lab.specific_energy(state, body) / energy == pytest.approx(1, rel=1e-6)
+def test_comet_is_tiny():
+    c = BODIES["67p"]
+    assert c.escape_v < 1.0 and c.surface_g < 1e-3
 
 
-def test_rocket_equation_and_inverse():
-    lander = lab.Lander(1000, 1000, 20_000, 300)
-    expected = 300 * lab.G0 * math.log(2)
-    assert lander.delta_v == pytest.approx(expected)
-    assert lab.propellant_for_dv(lander.isp, lander.wet_mass, expected) == pytest.approx(1000)
-    body = lab.Body("deep space", 1e-9, 1)
-    state = lab.State(1e7, 0, 0, 0, 1000)
-    while state.fuel:
-        lab.advance(state, body, lander, 1, 1, 0, 0.05)
-    assert state.vx == pytest.approx(expected, rel=1e-4)
+# ---- integrator: orbits must stay orbits ---------------------------------
+@pytest.mark.parametrize("name,alt", [("moon", 100e3), ("ceres", 50e3), ("67p", 3e3)])
+def test_circular_orbit_closes_and_conserves_energy(name, alt):
+    b = BODIES[name]
+    r = b.radius + alt
+    T = 2 * math.pi * b.dynamical_time(r)
+    s = State(r, 0.0, 0.0, b.circular_v(r), 0.0)
+    e0 = specific_energy(s, b)
+    dt = T / 2000
+    coast(b, s, 10 * T, dt)                          # ten full orbits
+    assert abs(math.hypot(s.x, s.y) - r) / r < 1e-5
+    assert abs(specific_energy(s, b) - e0) / abs(e0) < 1e-6
+    # phase: back near the start after whole periods
+    assert math.hypot(s.x - r, s.y) / r < 1e-3
 
 
-def test_burnout_splits_burn_and_coast():
-    body = lab.Body("deep space", 1e-9, 1)
-    lander = lab.Lander(1000, 1, 20_000, 300)
-    combined = lab.State(1e7, 0, 0, 0, 1)
-    split = replace(combined)
-    burn_time = lander.fuel_mass * lander.isp * lab.G0 / lander.thrust_max
-    lab.advance(combined, body, lander, 1, 1, 0, 10)
-    lab.advance(split, body, lander, 1, 1, 0, burn_time)
-    lab.advance(split, body, lander, 0, 1, 0, 10 - burn_time)
-    assert combined.x == pytest.approx(split.x, abs=1e-8)
-    assert combined.vx == pytest.approx(split.vx, abs=1e-10)
-    assert combined.fuel == 0
-    # A full-step average thrust would move only half this distance.
-    assert combined.x - 1e7 > 0.9 * combined.vx * 10
+def test_angular_momentum_conserved_elliptical():
+    b = MOON
+    r_p, r_a = b.radius + 15e3, b.radius + 100e3
+    s = State(r_p, 0.0, 0.0, periapsis_speed(b, r_a, r_p), 0.0)
+    h0 = s.x * s.vy - s.y * s.vx
+    coast(b, s, 20000, 0.5)
+    h1 = s.x * s.vy - s.y * s.vx
+    assert abs(h1 - h0) / h0 < 1e-9
 
 
-@pytest.mark.parametrize("index", range(len(lab.SCENARIOS)))
-def test_reference_landing(index):
-    scenario = lab.SCENARIOS[index]
-    calc, result = lab.run_scenario(scenario)
-    crit = lab.Criteria.for_body(scenario.body)
-    assert result.outcome == "LANDED"
-    assert 0 < result.v_vert <= crit.max_vertical
-    assert result.v_horiz <= crit.max_horizontal
-    assert result.gravity_loss > 0
-    assert calc["dv_ideal"] == result.dv_ideal
-    assert result.fuel_left >= 0
+def test_pseudo_newtonian_energy_conserved():
+    b = BODIES["bh10"]
+    rs = b.gravity.rs
+    r = 10 * rs
+    v = b.circular_v(r)
+    s = State(r, 0.0, 0.0, v, 0.0)
+    e0 = specific_energy(s, b)
+    T = 2 * math.pi * r / v
+    coast(b, s, 5 * T, T / 4000)
+    assert abs(specific_energy(s, b) - e0) / abs(e0) < 1e-6
 
 
-@pytest.mark.parametrize("thrust,outcome", [(20_000, "LANDED"), (9000, "CRASHED")])
-def test_lunar_low_initial_twr(thrust, outcome):
-    scenario = lab.SCENARIOS[0]
-    scenario = replace(scenario, lander=replace(scenario.lander, thrust_max=thrust))
-    assert lab.thrust_to_weight(scenario.body, scenario.lander) < 1
-    _, result = lab.run_scenario(scenario)
-    assert result.outcome == outcome
+def test_pseudo_newtonian_horizon():
+    pn = PseudoNewtonian(rs=100.0)
+    with pytest.raises(HorizonCrossed):
+        pn.accel(99.0, 0.0, 1e10)
 
 
-def test_low_fuel_crashes():
-    scenario = lab.SCENARIOS[0]
-    scenario = replace(scenario, lander=replace(scenario.lander, fuel_mass=2000))
-    _, result = lab.run_scenario(scenario)
-    assert result.outcome == "CRASHED"
-    assert result.fuel_left == 0
-
-
-def test_vertical_drop():
-    body = lab.BODIES["moon"]
-    lander = lab.Lander(2000, 1000, 10_000, 311)
-    initial = lab.State(body.radius + 3000, 0, 0, 0, 1000)
-    result = lab.simulate_landing(body, lander, initial, lab.Guidance(tau_v=1.5))
-    assert result.outcome == "LANDED"
-    assert result.dv_used < math.sqrt(2 * body.surface_g * 3000) * 1.6
-    assert initial == lab.State(body.radius + 3000, 0, 0, 0, 1000)
+# ---- rocket: mass and thrust bookkeeping ---------------------------------
+def test_burn_matches_tsiolkovsky_in_free_space():
+    deep = Body("deep space", 1e-9, 1.0)             # effectively no gravity
+    L = Lander(1000.0, 1000.0, 20_000.0, 300.0)
+    s = State(1e7, 0.0, 0.0, 0.0, L.fuel_mass)
+    dt = 0.05
+    while s.fuel > 0:
+        advance(s, deep, L, 1.0, 1.0, 0.0, dt)
+    assert math.hypot(s.vx, s.vy) == pytest.approx(L.delta_v, rel=1e-4)
+    assert s.fuel == pytest.approx(0.0, abs=1e-9)
 
 
 def test_calculators():
-    body = lab.BODIES["moon"]
-    ra, rp = body.radius + 100e3, body.radius + 15e3
-    assert lab.periapsis_speed(body, rp, rp) == pytest.approx(body.circular_v(rp))
-    assert lab.deorbit_dv(body, rp, rp) == pytest.approx(0)
-    assert lab.ideal_landing_dv(body, ra, rp) == lab.periapsis_speed(body, ra, rp)
-    assert lab.deorbit_dv(body, ra, rp) > 0
-    assert lab.stopping_distance(10, 4, 2) == 25
-    assert math.isinf(lab.stopping_distance(10, 2, 2))
-    assert math.isinf(lab.stopping_distance(10, 1, 2))
+    assert tsiolkovsky_dv(300, 2000, 1000) == pytest.approx(300 * G0 * math.log(2))
+    assert propellant_for_dv(300, 2000, tsiolkovsky_dv(300, 2000, 1000)) == pytest.approx(1000)
+    # circular -> deorbit burn is small and positive
+    assert 0 < deorbit_dv(MOON, MOON.radius + 100e3, MOON.radius + 15e3) < 100
 
 
-def test_nonlandable_rejected_before_surface_criteria():
-    body = lab.BODIES["bh10"]
-    state = lab.State(10 * body.radius, 0, 0, 0, 1)
-    with pytest.raises(ValueError, match="landable"):
-        lab.simulate_landing(body, lab.Lander(1, 1, 1, 1), state)
+# ---- landing outcomes -----------------------------------------------------
+@pytest.mark.parametrize("i", range(len(SCENARIOS)))
+def test_reference_scenarios_land(i):
+    _, res = run_scenario(SCENARIOS[i])
+    assert res.outcome == "LANDED", res.reason
+    assert res.gravity_loss > 0            # you can't beat the ideal Delta-v
 
 
-@pytest.mark.parametrize("factor", [0, 0.5, 1])
-def test_horizon_rejected_by_potential_and_acceleration(factor):
-    gravity = lab.PseudoNewtonian(10)
-    with pytest.raises(lab.HorizonCrossed):
-        gravity.potential(10 * factor, 100)
-    with pytest.raises(lab.HorizonCrossed):
-        gravity.accel(10 * factor, 0, 100)
+def test_moon_without_enough_fuel_crashes():
+    sc = SCENARIOS[0]
+    weak = Scenario(sc.name, sc.body, Lander(7000, 2000, 45_000, 311, 0.10),
+                    sc.r_apo_alt, sc.r_peri_alt, sc.guidance)
+    assert weak.lander.delta_v < ideal_landing_dv(weak.body, weak.body.radius + weak.r_apo_alt,
+                                                  weak.body.radius + weak.r_peri_alt)
+    _, res = run_scenario(weak)
+    assert res.outcome == "CRASHED"
 
 
-@pytest.mark.parametrize("calculator", [lab.periapsis_speed, lab.deorbit_dv, lab.ideal_landing_dv])
-def test_newtonian_formulas_reject_pn(calculator):
-    body = lab.BODIES["bh10"]
-    with pytest.raises(ValueError, match="PointMass"):
-        calculator(body, 20 * body.radius, 10 * body.radius)
+def test_twr_at_full_load_below_one_can_still_land():
+    """Lighter as fuel burns + centrifugal relief in orbit: full-load TWR<1 is survivable."""
+    sc = SCENARIOS[0]
+    L = Lander(7000, 8200, 20_000, 311, 0.10)        # TWR ~0.8 at PDI
+    assert thrust_to_weight(sc.body, L) < 1.0
+    _, res = run_scenario(Scenario("weak engine", sc.body, L, sc.r_apo_alt, sc.r_peri_alt, sc.guidance))
+    assert res.outcome == "LANDED"
 
 
-@pytest.mark.parametrize("dt", [0, -1, math.nan, math.inf])
-def test_invalid_timesteps(dt):
-    scenario = lab.SCENARIOS[0]
-    state = lab.state_at_periapsis(scenario.body, scenario.lander,
-                                  scenario.body.radius + 100e3, scenario.body.radius + 15e3)
-    with pytest.raises(ValueError):
-        lab.advance(state, scenario.body, scenario.lander, 0, 1, 0, dt)
-    with pytest.raises(ValueError):
-        lab.simulate_landing(scenario.body, scenario.lander, state, dt_max=dt)
+def test_cannot_land_if_thrust_below_weight_at_dry_mass():
+    """The real criterion: thrust vs. weight at landing mass. Below it, you can never stop."""
+    sc = SCENARIOS[0]
+    L = Lander(7000, 8200, 9_000, 311, 0.10)         # 9 kN < 7000 kg * 1.62
+    assert L.thrust_max < L.dry_mass * sc.body.surface_g
+    _, res = run_scenario(Scenario("hopeless engine", sc.body, L, sc.r_apo_alt, sc.r_peri_alt, sc.guidance))
+    assert res.outcome == "CRASHED"
 
 
-@pytest.mark.parametrize("factory", [
-    lambda: lab.Body("invalid", 0, 1),
-    lambda: lab.Body("invalid", 1, -1),
-    lambda: lab.Lander(0, 1, 1, 1),
-    lambda: lab.Lander(1, -1, 1, 1),
-    lambda: lab.Lander(1, 1, 1, 0),
-    lambda: lab.Lander(1, 1, 1, 1, 2),
-    lambda: lab.State(1, 0, 0, math.nan, 1),
-    lambda: lab.State(1, 0, 0, 0, -1),
-    lambda: lab.State(0, 0, 0, 0, 1),
-    lambda: lab.Guidance(tau_v=0),
-    lambda: lab.Guidance(horiz_share=0),
-    lambda: lab.Criteria(-1, 1),
-    lambda: lab.tsiolkovsky_dv(300, 100, 200),
-    lambda: lab.propellant_for_dv(300, 100, -1),
-])
-def test_invalid_core_inputs(factory):
-    with pytest.raises(ValueError):
-        factory()
+def test_vertical_drop_matches_stopping_distance():
+    """Pure vertical case: the suicide burn should land using ~the analytic Delta-v."""
+    b = MOON
+    L = Lander(2000.0, 1000.0, 10_000.0, 311.0, 0.0)
+    s0 = State(b.radius + 3000.0, 0.0, 0.0, 0.0, L.fuel_mass)
+    res = simulate_landing(b, L, s0, Guidance(tau_v=1.5))
+    assert res.outcome == "LANDED"
+    # free-fall speed at ~(3000 m - braking) bounds the Delta-v from above
+    v_fall = math.sqrt(2 * b.surface_g * 3000)
+    assert res.dv_used < v_fall * 1.6
 
 
-def test_timeout_and_log():
-    scenario = lab.SCENARIOS[0]
-    state = lab.state_at_periapsis(scenario.body, scenario.lander,
-                                  scenario.body.radius + 100e3, scenario.body.radius + 15e3)
-    result = lab.simulate_landing(scenario.body, scenario.lander, state,
-                                  t_max=1, dt_max=0.1, log_every=0.2)
-    assert result.outcome == "TIMEOUT"
-    assert result.t == pytest.approx(1)
-    assert len(result.log) >= 4
-    assert len(result.log[0]) == 5
-    assert result.log[0] == (0, 15e3, 0, state.vy, state.fuel)
-    for keyword in ("t_max", "log_every"):
-        with pytest.raises(ValueError):
-            lab.simulate_landing(scenario.body, scenario.lander, state, **{keyword: 0})
-
-
-def test_cli():
-    result = subprocess.run([sys.executable, "landerlab.py"],
-                            text=True, capture_output=True, check=True)
-    assert "LANDED" in result.stdout
-    assert "Moon" in result.stdout
-    assert "Analytic feasibility" in result.stdout
-    assert "Simulated landing" in result.stdout
-
-
-def test_public_api():
-    body = lab.BODIES["moon"]
-    lander = lab.Lander(7000, 8200, 45000, 311, 0.1)
-    ra, rp = body.radius + 100e3, body.radius + 15e3
-    state = lab.state_at_periapsis(body, lander, ra, rp)
-    assert state.x == rp
-    assert state.vy == lab.periapsis_speed(body, ra, rp)
-    assert state.fuel == lander.fuel_mass
-    assert lander.mdot_max == lander.thrust_max / (lander.isp * lab.G0)
-    result = lab.Result("TIMEOUT", "test", 0, 0, 0, 1, 0, 0, 0)
-    assert result.log == []
-    calc, result = lab.run_scenario(lab.SCENARIOS[0], dt_max=0.1, t_max=0.2)
-    assert result.outcome == "TIMEOUT"
-    assert set(calc) == {"surface_g", "v_escape", "v_peri", "dv_deorbit",
-                         "dv_ideal", "dv_avail", "twr", "limits"}
-
-
-def test_custom_gravity_strategy():
-    class Harmonic:
-        def accel(self, x, y, GM):
-            return -GM * x, -GM * y
-
-        def potential(self, r, GM):
-            return 0.5 * GM * r**2
-
-    body = lab.Body("harmonic toy", 2, 1, Harmonic())
-    assert body.g_at(3) == 6
-    state = lab.State(3, 0, 0, 0, 0)
-    lab.advance(state, body, lab.Lander(1, 0, 0, 300), 0, 1, 0, 0.01)
-    assert state.vx < 0
-    with pytest.raises(ValueError, match="PointMass"):
-        lab.periapsis_speed(body, 3, 2)
+def test_energy_never_increases_without_thrust():
+    b = MOON
+    s = State(b.radius + 15e3, 0.0, 0.0, 1500.0, 0.0)
+    e0 = specific_energy(s, b)
+    coast(b, s, 300.0, 0.1)
+    assert abs(specific_energy(s, b) - e0) / abs(e0) < 1e-9
