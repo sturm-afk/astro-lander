@@ -99,6 +99,47 @@ def test_advance_controlled_applies_throttle_and_burns_fuel():
     assert s.t == 1.0
 
 
+def test_simulate_player_landing_requests_fresh_controls_and_times_out():
+    deep = Body("deep space", 1e-9, 1.0)
+    L = Lander(100.0, 10.0, 100.0, 300.0)
+    s0 = State(1e7, 0.0, 0.0, 10.0, L.fuel_mass)
+    observed = []
+
+    def control_source(state):
+        observed.append((state.t, state.vy))
+        return PlayerControl(0.5 if state.t == 0.0 else 0.25)
+
+    result = simulate_player_landing(deep, L, s0, control_source, dt=1.0, t_max=2.0)
+
+    assert result.outcome == "TIMEOUT"
+    assert result.steps == 2
+    assert [t for t, _ in observed] == [0.0, 1.0]
+    assert observed[1][1] > observed[0][1]
+    assert result.fuel_left == pytest.approx(10.0 - 0.75 * L.mdot_max)
+    assert s0.t == 0.0 and s0.fuel == L.fuel_mass
+
+
+@pytest.mark.parametrize(("vx", "outcome"), [(0.0, "LANDED"), (-10.0, "CRASHED")])
+def test_simulate_player_landing_reports_touchdown_outcome(vx, outcome):
+    s0 = State(MOON.radius + 0.001, 0.0, vx, 0.0, 0.0)
+    L = Lander(100.0, 0.0, 100.0, 300.0)
+
+    result = simulate_player_landing(
+        MOON, L, s0, lambda state: PlayerControl(), dt=0.1, t_max=1.0,
+    )
+
+    assert result.outcome == outcome
+    assert result.steps == 1
+
+
+@pytest.mark.parametrize("dt", [0.0, -0.1, math.inf, math.nan])
+def test_simulate_player_landing_rejects_invalid_timestep(dt):
+    with pytest.raises(ValueError, match="dt"):
+        simulate_player_landing(MOON, Lander(1.0, 0.0, 1.0, 300.0),
+                                State(MOON.radius + 1.0, 0.0, 0.0, 0.0, 0.0),
+                                lambda state: PlayerControl(), dt=dt)
+
+
 @pytest.mark.parametrize("throttle", [-0.1, 1.1, math.inf, math.nan])
 def test_player_control_rejects_invalid_throttle(throttle):
     with pytest.raises(ValueError):

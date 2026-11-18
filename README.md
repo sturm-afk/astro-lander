@@ -46,7 +46,11 @@ For player-directed maneuvers, create `PlayerControl(throttle, angle)` and call
 is a fraction from 0 to 1; angle is in radians from current prograde (positive
 counterclockwise, so pi is retrograde). At rest, prograde falls back to the local
 counterclockwise tangent. Inspect the updated state and issue another command as
-needed; this API has no UI or automatic docking/landing guidance.
+needed. `simulate_player_landing(body, lander, state, control_source, dt=0.1)`
+does this until touchdown or timeout, asking `control_source(state_snapshot)` for
+a fresh `PlayerControl` each step and returning the resulting `Result`. A
+keyboard/mouse or gamepad adapter can translate its inputs into the same
+throttle-and-angle command; no device handling or UI is included here.
 
 The default guidance prioritizes vertical stopping and uses remaining thrust
 for orbital braking. Initial **surface** TWR below one is not an automatic
