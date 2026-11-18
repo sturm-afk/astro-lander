@@ -45,10 +45,15 @@ For player-directed maneuvers, create `PlayerControl(throttle, angle)` and call
 `advance_controlled(state, body, lander, control, dt)` one step at a time. Throttle
 is a fraction from 0 to 1; angle is in radians from current prograde (positive
 counterclockwise, so pi is retrograde). At rest, prograde falls back to the local
-counterclockwise tangent. Inspect the updated state and issue another command as
-needed. `simulate_player_landing(body, lander, state, control_source, dt=0.1)`
-does this until touchdown or timeout, asking `control_source(state_snapshot)` for
-a fresh `PlayerControl` each step and returning the resulting `Result`. A
+counterclockwise tangent. `PlayerControl` also accepts `time_scale`, a positive
+finite multiplier for the simulated duration of each step (default `1.0`); for
+example, `PlayerControl(time_scale=10)` advances ten times as much simulated
+time per call. Inspect the updated state and issue another command as needed.
+`simulate_player_landing(body, lander, state, control_source, dt=0.1)` does this
+until touchdown or timeout, asking `control_source(state_snapshot)` for a fresh
+`PlayerControl` each step and returning the resulting `Result`. The command,
+including its time scale, is held for that scaled step, so use larger scales for
+coasting and smaller scales near maneuvers for finer control. A
 keyboard/mouse or gamepad adapter can translate its inputs into the same
 throttle-and-angle command; no device handling or UI is included here.
 

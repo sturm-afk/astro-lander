@@ -202,12 +202,15 @@ class PlayerControl:
     """Manual engine command: throttle fraction and steering angle from prograde, in radians."""
     throttle: float = 0.0
     angle: float = 0.0
+    time_scale: float = 1.0
 
     def __post_init__(self):
         if not math.isfinite(self.throttle) or not 0.0 <= self.throttle <= 1.0:
             raise ValueError("throttle must be between 0 and 1")
         if not math.isfinite(self.angle):
             raise ValueError("angle must be finite")
+        if not math.isfinite(self.time_scale) or self.time_scale <= 0.0:
+            raise ValueError("time_scale must be a positive finite number")
 
     def command(self, s: State) -> tuple[float, float, float]:
         speed = math.hypot(s.vx, s.vy)
@@ -256,9 +259,12 @@ def advance(s: State, body: Body, lander: Lander, throttle: float,
 
 def advance_controlled(s: State, body: Body, lander: Lander,
                        control: PlayerControl, dt: float) -> None:
-    """Apply one player command; call again after inspecting the updated state."""
+    """Apply one player command for dt * time_scale seconds."""
+    scaled_dt = dt * control.time_scale
+    if not math.isfinite(scaled_dt) or scaled_dt <= 0.0:
+        raise ValueError("scaled timestep must be a positive finite number")
     throttle, ux, uy = control.command(s)
-    advance(s, body, lander, throttle, ux, uy, dt)
+    advance(s, body, lander, throttle, ux, uy, scaled_dt)
 
 
 @dataclass
@@ -454,7 +460,7 @@ def simulate_player_landing(body: Body, lander: Lander, s0: State,
         control = control_source(snapshot)
         if not isinstance(control, PlayerControl):
             raise TypeError("control_source must return a PlayerControl")
-        step = min(dt, t_max - s.t)
+        step = min(dt, (t_max - s.t) / control.time_scale)
         throttle = control.throttle if s.fuel > 0 else 0.0
         if s.fuel > 0:
             peak_a = max(peak_a, throttle * lander.thrust_max / m)
