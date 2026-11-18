@@ -1,83 +1,79 @@
-#!/usr/bin/env python3
-"""A standard-library-only, planar, airless landing laboratory. Units are SI."""
+"""
+landerlab.py -- headless landing physics for a configurable central body.
 
+No graphics. Everything is SI (m, s, kg, N). 2D planar, point-mass lander,
+instantaneous attitude (thrust direction is free). Atmosphere, rotation of the
+body, and attitude dynamics are deliberately left out for now.
+
+Layers
+  1. Body + gravity models (swappable)            -> "what world is this?"
+  2. Lander + analytic calculators (closed form)  -> "is this even feasible?"
+  3. Integrator + guidance + simulate_landing()   -> "what actually happens?"
+  4. SCENARIOS + print_table()                    -> the comparison table
+Run `python landerlab.py` for the table, `pytest` for the validation tests.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
 import math
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Optional, Protocol
 
-G0 = 9.80665
+G0 = 9.80665          # m/s^2, standard gravity (used only in the rocket equation)
 C_LIGHT = 299_792_458.0
 
 
-def _positive(name: str, value: float, zero: bool = False) -> None:
-    if not math.isfinite(value) or (value < 0 if zero else value <= 0):
-        raise ValueError(f"{name} must be finite and {'nonnegative' if zero else 'positive'}")
-
-
-class HorizonCrossed(ValueError):
-    """The pseudo-Newtonian horizon was reached."""
+# --------------------------------------------------------------------------
+# 1. Bodies and gravity models
+# --------------------------------------------------------------------------
+class HorizonCrossed(Exception):
+    pass
 
 
 class GravityModel(Protocol):
     def accel(self, x: float, y: float, GM: float) -> tuple[float, float]: ...
-
     def potential(self, r: float, GM: float) -> float: ...
 
 
 @dataclass(frozen=True)
 class PointMass:
-    def accel(self, x: float, y: float, GM: float) -> tuple[float, float]:
-        r = math.hypot(x, y)
-        _positive("radius", r)
-        return -GM * x / r**3, -GM * y / r**3
+    """Newtonian a = -GM r_hat / r^2."""
+    def accel(self, x, y, GM):
+        r2 = x * x + y * y
+        k = -GM / (r2 * math.sqrt(r2))
+        return k * x, k * y
 
-    def potential(self, r: float, GM: float) -> float:
-        _positive("radius", r)
+    def potential(self, r, GM):
         return -GM / r
 
 
 @dataclass(frozen=True)
 class PseudoNewtonian:
-    """Paczyński–Wiita toy potential, not a general-relativistic integrator."""
-
+    """Paczynski-Wiita: Phi = -GM/(r - Rs). Gives an ISCO at 3 Rs and a horizon at Rs."""
     rs: float
 
-    def __post_init__(self) -> None:
-        _positive("rs", self.rs)
-
-    def _check(self, r: float) -> None:
-        if not math.isfinite(r):
-            raise ValueError("radius must be finite")
-        if r <= self.rs:
-            raise HorizonCrossed("at or inside the Schwarzschild radius")
-
-    def accel(self, x: float, y: float, GM: float) -> tuple[float, float]:
+    def accel(self, x, y, GM):
         r = math.hypot(x, y)
-        self._check(r)
-        scale = -GM / ((r - self.rs)**2 * r)
-        return scale * x, scale * y
+        d = r - self.rs
+        if d <= 0:
+            raise HorizonCrossed("r <= Rs")
+        k = -GM / (d * d * r)
+        return k * x, k * y
 
-    def potential(self, r: float, GM: float) -> float:
-        self._check(r)
+    def potential(self, r, GM):
         return -GM / (r - self.rs)
 
 
 @dataclass(frozen=True)
 class Body:
     name: str
-    GM: float
-    radius: float
+    GM: float                       # m^3/s^2 (GM is known better than G or M separately)
+    radius: float                   # m
     gravity: GravityModel = field(default_factory=PointMass)
     landable: bool = True
 
-    def __post_init__(self) -> None:
-        _positive("GM", self.GM)
-        _positive("radius", self.radius)
-
     def g_at(self, r: float) -> float:
-        return -self.gravity.accel(r, 0, self.GM)[0]
+        gx, gy = self.gravity.accel(r, 0.0, self.GM)
+        return -gx
 
     @property
     def surface_g(self) -> float:
@@ -85,112 +81,95 @@ class Body:
 
     @property
     def escape_v(self) -> float:
-        return math.sqrt(-2 * self.gravity.potential(self.radius, self.GM))
+        return math.sqrt(-2.0 * self.gravity.potential(self.radius, self.GM))
 
     def circular_v(self, r: float) -> float:
         return math.sqrt(r * self.g_at(r))
 
     def dynamical_time(self, r: float) -> float:
-        _positive("radius", r)
-        return math.sqrt(r**3 / self.GM)
+        """sqrt(r^3/GM): the natural time unit at radius r (orbital period = 2*pi*this)."""
+        return math.sqrt(r ** 3 / self.GM)
 
 
-_BH_GM = 10 * 1.32712440018e20
-_BH_RS = 2 * _BH_GM / C_LIGHT**2
+_BH10_GM = 1.32712440018e20 * 10
 BODIES = {
-    "moon": Body("Moon", 4.9048695e12, 1_737_400),
-    "ceres": Body("Ceres", 6.2628e10, 469_700),
-    "67p": Body("67P", 666.2, 2_000),
-    "bh10": Body("10 solar-mass black hole", _BH_GM, _BH_RS,
-                 PseudoNewtonian(_BH_RS), landable=False),
+    "moon":  Body("Moon", 4.9048695e12, 1_737_400.0),
+    "ceres": Body("Ceres", 6.2628e10, 469_700.0),
+    "67p":   Body("Comet 67P", 666.2, 2_000.0),
+    "bh10":  Body("10 Msun black hole", _BH10_GM, 2 * _BH10_GM / C_LIGHT ** 2,
+                  PseudoNewtonian(2 * _BH10_GM / C_LIGHT ** 2), landable=False),
 }
 
 
-@dataclass(frozen=True)
+# --------------------------------------------------------------------------
+# 2. Lander and analytic calculators
+# --------------------------------------------------------------------------
+@dataclass
 class Lander:
-    dry_mass: float
-    fuel_mass: float
-    thrust_max: float
-    isp: float
-    min_throttle: float = 0.0
-
-    def __post_init__(self) -> None:
-        _positive("dry_mass", self.dry_mass)
-        _positive("fuel_mass", self.fuel_mass, True)
-        _positive("thrust_max", self.thrust_max, True)
-        _positive("isp", self.isp)
-        if not math.isfinite(self.min_throttle) or not 0 <= self.min_throttle <= 1:
-            raise ValueError("min_throttle must be between zero and one")
+    dry_mass: float                 # structure + engines + tanks (kg)
+    fuel_mass: float                # propellant (kg)
+    thrust_max: float               # N
+    isp: float                      # s
+    min_throttle: float = 0.0       # engine can't run below this fraction (or is off)
+    payload_mass: float = 0.0       # cargo/crew/instruments, carried all the way down (kg)
+    name: str = ""
 
     @property
-    def wet_mass(self) -> float:
-        return self.dry_mass + self.fuel_mass
-
-    @property
-    def delta_v(self) -> float:
-        return tsiolkovsky_dv(self.isp, self.wet_mass, self.dry_mass)
+    def empty_mass(self) -> float:
+        """Everything that is still there after the propellant is gone."""
+        return self.dry_mass + self.payload_mass
 
     @property
     def mdot_max(self) -> float:
         return self.thrust_max / (self.isp * G0)
 
+    @property
+    def wet_mass(self) -> float:
+        return self.empty_mass + self.fuel_mass
 
-@dataclass(frozen=True)
+    @property
+    def delta_v(self) -> float:
+        return tsiolkovsky_dv(self.isp, self.wet_mass, self.empty_mass)
+
+    def with_(self, **changes) -> "Lander":
+        """Copy with some fields changed, e.g. lander.with_(payload_mass=500)."""
+        from dataclasses import replace
+        return replace(self, **changes)
+
+
+@dataclass
 class Criteria:
-    max_vertical: float = 3.0
-    max_horizontal: float = 1.0
+    """Success window. Defaults scale with the body so a comet isn't judged by lunar rules."""
+    max_vertical: float
+    max_horizontal: float
 
-    def __post_init__(self) -> None:
-        _positive("max_vertical", self.max_vertical, True)
-        _positive("max_horizontal", self.max_horizontal, True)
-
-    @classmethod
-    def for_body(cls, body: Body, vertical: float = 3.0,
-                 horizontal: float = 1.0) -> Criteria:
-        if not body.landable:
-            raise ValueError("body has no landable surface")
-        cap = 0.1 * body.escape_v
-        return cls(min(vertical, cap), min(horizontal, 0.5 * cap))
+    @staticmethod
+    def for_body(body: Body, vertical: float = 3.0, horizontal: float = 1.0) -> "Criteria":
+        cap = 0.1 * body.escape_v           # touchdown must be << escape speed
+        return Criteria(min(vertical, cap), min(horizontal, 0.5 * cap))
 
 
-def tsiolkovsky_dv(isp: float, m0: float, mf: float) -> float:
-    _positive("isp", isp)
-    _positive("m0", m0)
-    _positive("mf", mf)
-    if mf > m0:
-        raise ValueError("final mass cannot exceed initial mass")
-    return isp * G0 * math.log(m0 / mf)
+def tsiolkovsky_dv(isp: float, m0: float, m1: float) -> float:
+    return isp * G0 * math.log(m0 / m1)
 
 
 def propellant_for_dv(isp: float, m0: float, dv: float) -> float:
-    _positive("isp", isp)
-    _positive("m0", m0)
-    _positive("dv", dv, True)
-    return -m0 * math.expm1(-dv / (isp * G0))
-
-
-def _newtonian(body: Body) -> None:
-    if not isinstance(body.gravity, PointMass):
-        raise ValueError("Newtonian orbital formulas require PointMass gravity")
+    return m0 * (1.0 - math.exp(-dv / (isp * G0)))
 
 
 def periapsis_speed(body: Body, r_apo: float, r_peri: float) -> float:
-    _newtonian(body)
-    _positive("r_apo", r_apo)
-    _positive("r_peri", r_peri)
-    if r_apo < r_peri:
-        raise ValueError("apoapsis must be at least periapsis")
     return math.sqrt(2 * body.GM * r_apo / (r_peri * (r_apo + r_peri)))
 
 
-def deorbit_dv(body: Body, r_apo: float, r_peri: float) -> float:
-    periapsis_speed(body, r_apo, r_peri)
-    return math.sqrt(body.GM / r_apo) - math.sqrt(
-        2 * body.GM * r_peri / (r_apo * (r_apo + r_peri)))
+def deorbit_dv(body: Body, r_circ: float, r_peri: float) -> float:
+    """Hohmann-style retrograde burn lowering periapsis from a circular orbit."""
+    a = 0.5 * (r_circ + r_peri)
+    v_apo = math.sqrt(body.GM * (2 / r_circ - 1 / a))
+    return body.circular_v(r_circ) - v_apo
 
 
 def ideal_landing_dv(body: Body, r_apo: float, r_peri: float) -> float:
-    """Cancel periapsis velocity instantaneously; excludes the deorbit burn."""
+    """Lower bound: cancel all periapsis speed, zero gravity losses. Reality costs more."""
     return periapsis_speed(body, r_apo, r_peri)
 
 
@@ -199,13 +178,15 @@ def thrust_to_weight(body: Body, lander: Lander) -> float:
 
 
 def stopping_distance(v: float, a_thrust: float, g: float) -> float:
-    if not math.isfinite(v):
-        raise ValueError("v must be finite")
-    _positive("a_thrust", a_thrust, True)
-    _positive("g", g, True)
-    return v**2 / (2 * (a_thrust - g)) if a_thrust > g else math.inf
+    """Vertical suicide-burn distance to null a downward speed v. Needs a_thrust > g."""
+    if a_thrust <= g:
+        return math.inf
+    return v * v / (2.0 * (a_thrust - g))
 
 
+# --------------------------------------------------------------------------
+# 3. Integrator, guidance, simulation
+# --------------------------------------------------------------------------
 @dataclass
 class State:
     x: float
@@ -215,133 +196,105 @@ class State:
     fuel: float
     t: float = 0.0
 
-    def __post_init__(self) -> None:
-        for name in ("x", "y", "vx", "vy", "t"):
-            if not math.isfinite(getattr(self, name)):
-                raise ValueError(f"{name} must be finite")
-        if math.hypot(self.x, self.y) == 0:
-            raise ValueError("position cannot be the origin")
-        _positive("fuel", self.fuel, True)
-        _positive("t", self.t, True)
+
+def state_at_periapsis(body: Body, lander: Lander, r_apo: float, r_peri: float) -> State:
+    return State(r_peri, 0.0, 0.0, periapsis_speed(body, r_apo, r_peri), lander.fuel_mass)
 
 
-def _verlet(s: State, body: Body, ax: float, ay: float, dt: float) -> None:
-    gx, gy = body.gravity.accel(s.x, s.y, body.GM)
-    x = s.x + s.vx * dt + 0.5 * (gx + ax) * dt**2
-    y = s.y + s.vy * dt + 0.5 * (gy + ay) * dt**2
-    gx1, gy1 = body.gravity.accel(x, y, body.GM)
-    s.vx += (0.5 * (gx + gx1) + ax) * dt
-    s.vy += (0.5 * (gy + gy1) + ay) * dt
-    s.x, s.y = x, y
-    s.t += dt
+def specific_energy(s: State, body: Body) -> float:
+    return 0.5 * (s.vx ** 2 + s.vy ** 2) + body.gravity.potential(math.hypot(s.x, s.y), body.GM)
 
 
 def advance(s: State, body: Body, lander: Lander, throttle: float,
             ux: float, uy: float, dt: float) -> None:
-    """Mutate state using velocity Verlet; split a partially fueled timestep."""
-    _positive("dt", dt)
-    if not math.isfinite(throttle) or not 0 <= throttle <= 1:
-        raise ValueError("throttle must be between zero and one")
-    if not math.isfinite(ux) or not math.isfinite(uy):
-        raise ValueError("thrust direction must be finite")
-    _positive("fuel", s.fuel, True)
-    force = lander.thrust_max * throttle
-    if force and s.fuel:
-        norm = math.hypot(ux, uy)
-        if not math.isclose(norm, 1, rel_tol=1e-9, abs_tol=1e-12):
-            raise ValueError("powered thrust direction must be a unit vector")
-        flow = force / (lander.isp * G0)
-        fuel_time = s.fuel / flow
-        burn_dt = min(dt, fuel_time)
-        fuel_used = s.fuel if fuel_time <= dt else flow * burn_dt
-        m0 = lander.dry_mass + s.fuel
-        mf = m0 - fuel_used
-        # Exact integrated impulse, with a coast after (not during) fuel burnout.
-        a = lander.isp * G0 * math.log(m0 / mf) / burn_dt
-        _verlet(s, body, a * ux, a * uy, burn_dt)
-        s.fuel = max(0.0, s.fuel - fuel_used)
-        if burn_dt < dt:
-            _verlet(s, body, 0, 0, dt - burn_dt)
-    else:
-        _verlet(s, body, 0, 0, dt)
+    """One velocity-Verlet step. Thrust is held constant over the step; mass is
+    taken at mid-step; fuel runs out mid-step correctly."""
+    m0 = lander.empty_mass + s.fuel
+    thr = throttle if s.fuel > 0 else 0.0
+    dm = thr * lander.mdot_max * dt
+    if dm > s.fuel:                       # ran dry partway through the step
+        thr *= s.fuel / dm
+        dm = s.fuel
+    a_t = thr * lander.thrust_max / (m0 - 0.5 * dm)
+    atx, aty = a_t * ux, a_t * uy
+
+    gx, gy = body.gravity.accel(s.x, s.y, body.GM)
+    a0x, a0y = gx + atx, gy + aty
+    s.x += s.vx * dt + 0.5 * a0x * dt * dt
+    s.y += s.vy * dt + 0.5 * a0y * dt * dt
+    gx1, gy1 = body.gravity.accel(s.x, s.y, body.GM)
+    s.vx += 0.5 * (a0x + gx1 + atx) * dt
+    s.vy += 0.5 * (a0y + gy1 + aty) * dt
+    s.fuel -= dm
+    s.t += dt
 
 
-def specific_energy(s: State, body: Body) -> float:
-    return 0.5 * (s.vx**2 + s.vy**2) + body.gravity.potential(
-        math.hypot(s.x, s.y), body.GM)
-
-
-def state_at_periapsis(body: Body, lander: Lander,
-                      r_apo: float, r_peri: float) -> State:
-    return State(r_peri, 0, 0, periapsis_speed(body, r_apo, r_peri), lander.fuel_mass)
-
-
-@dataclass(frozen=True)
+@dataclass
 class Guidance:
-    tau_v: float = 3.0
-    tau_h: float = 3.0
-    decel_fraction: float = 0.6
-    horiz_share: float = 0.5
-    touch_speed: float | None = None
+    """Vertical-priority braking. Tracks a descent-rate profile v_r = -(v_touch + sqrt(2 a h)),
+    spends whatever thrust is left killing horizontal speed. No target site: it lands where
+    the orbit takes it."""
+    tau_v: float = 3.0              # s, vertical-rate response time
+    tau_h: float = 3.0              # s, horizontal-speed response time
+    decel_fraction: float = 0.6     # fraction of available net decel the profile assumes
+    horiz_share: float = 0.5        # fraction of max accel assumed available for horizontal braking
+    touch_speed: Optional[float] = None   # target sink rate at contact (default: half the limit)
 
-    def __post_init__(self) -> None:
-        _positive("tau_v", self.tau_v)
-        _positive("tau_h", self.tau_h)
-        for name in ("decel_fraction", "horiz_share"):
-            value = getattr(self, name)
-            _positive(name, value)
-            if value > 1:
-                raise ValueError(f"{name} must not exceed one")
-        if self.touch_speed is not None:
-            _positive("touch_speed", self.touch_speed, True)
-
-    def command(self, s: State, body: Body, lander: Lander,
-                crit: Criteria) -> tuple[float, float, float]:
+    def command(self, s: State, body: Body, lander: Lander, crit: Criteria):
         r = math.hypot(s.x, s.y)
         rx, ry = s.x / r, s.y / r
         tx, ty = -ry, rx
-        vr, vh = s.vx * rx + s.vy * ry, s.vx * tx + s.vy * ty
-        h = max(r - body.radius, 0)
-        a_max = lander.thrust_max / (lander.dry_mass + s.fuel)
-        if not a_max or not s.fuel:
-            return 0.0, 1.0, 0.0
+        vr = s.vx * rx + s.vy * ry
+        vh = s.vx * tx + s.vy * ty
+        h = max(r - body.radius, 0.0)
+        m = lander.empty_mass + s.fuel
+        a_max = lander.thrust_max / m
         g = body.g_at(r)
         v_touch = self.touch_speed if self.touch_speed is not None else 0.5 * crit.max_vertical
+
         a_dec = self.decel_fraction * max(a_max - g, 0.05 * a_max)
+        # (1) Suicide-burn law: start braking once the decel needed to reach v_touch
+        #     exactly at the surface equals what we're willing to use (a_dec); then track it.
         a_stop = 0.0
-        if h > 0 and vr < -v_touch:
-            a_req = (vr**2 - v_touch**2) / (2 * h)
+        if h > 0.0 and vr < -v_touch:
+            a_req = (vr * vr - v_touch ** 2) / (2.0 * h)
             if a_req >= a_dec:
                 a_stop = a_req
-        sink_alt = v_touch + h / (abs(vh) / (self.horiz_share * a_max) + 1)
+        # (2) Time-to-go limit: don't sink faster than altitude/(time to kill horizontal speed)
+        sink_alt = v_touch + h / (abs(vh) / (self.horiz_share * a_max) + 1.0)
         a_alt = max(0.0, (-sink_alt - vr) / self.tau_v)
+        # gravity minus centrifugal relief, plus the larger of the two demands
         demand = max(a_stop, a_alt)
-        a_up = g - vh * vh / r + demand if demand > 0 else 0.0
+        a_up = (g - vh * vh / r + demand) if demand > 0.0 else 0.0   # coast when nothing is needed
         a_up = min(max(a_up, 0.0), a_max)
-        a_h_lim = math.sqrt(max(a_max**2 - a_up**2, 0.0))
+        a_h_lim = math.sqrt(max(a_max ** 2 - a_up ** 2, 0.0))
         a_h = min(max(-vh / self.tau_h, -a_h_lim), a_h_lim)
+
         mag = math.hypot(a_up, a_h)
-        if mag <= 0:
+        if mag <= 0.0:
             return 0.0, 1.0, 0.0
-        throttle = min(1.0, mag / a_max)
-        if throttle < lander.min_throttle:
-            throttle = lander.min_throttle if throttle >= 0.5 * lander.min_throttle else 0.0
-        return (throttle, (a_up * rx + a_h * tx) / mag,
-                (a_up * ry + a_h * ty) / mag)
+        throttle = mag / a_max
+        mt = lander.min_throttle
+        if throttle < mt:
+            throttle = mt if throttle >= 0.5 * mt else 0.0
+        ux = (a_up * rx + a_h * tx) / mag
+        uy = (a_up * ry + a_h * ty) / mag
+        return throttle, ux, uy
 
 
 @dataclass
 class Result:
-    outcome: str
+    outcome: str                    # LANDED | CRASHED | TIMEOUT
     reason: str
     t: float
-    v_vert: float
+    v_vert: float                   # touchdown vertical speed (m/s, downward positive)
     v_horiz: float
     fuel_left: float
     dv_used: float
     dv_ideal: float
     steps: int
-    log: list[tuple[float, float, float, float, float]] = field(default_factory=list)
+    log: list = field(default_factory=list)
+    peak_g: float = 0.0             # peak thrust acceleration felt, in Earth g
 
     @property
     def gravity_loss(self) -> float:
@@ -349,120 +302,134 @@ class Result:
 
 
 def simulate_landing(body: Body, lander: Lander, s0: State,
-                     guidance: Guidance | None = None, crit: Criteria | None = None,
-                     dt_max: float | None = None, t_max: float | None = None,
-                     log_every: float | None = None) -> Result:
-    if not body.landable:
-        raise ValueError(f"{body.name} has no landable surface")
-    s = replace(s0)
-    s.__post_init__()
-    r0 = math.hypot(s.x, s.y)
-    if r0 < body.radius:
-        raise ValueError("initial state is below the surface")
-    if s.fuel > lander.fuel_mass:
-        raise ValueError("initial fuel exceeds lander capacity")
+                     guidance: Optional[Guidance] = None,
+                     crit: Optional[Criteria] = None,
+                     dt_max: Optional[float] = None,
+                     t_max: Optional[float] = None,
+                     log_every: Optional[float] = None) -> Result:
     guidance = guidance or Guidance()
     crit = crit or Criteria.for_body(body)
-    tdyn = body.dynamical_time(body.radius)
-    dt_max = max(0.001 * tdyn, 0.001) if dt_max is None else dt_max
-    dt_min = min(0.0001 * tdyn, dt_max)
-    t_max = 20 * body.dynamical_time(r0) if t_max is None else t_max
-    _positive("dt_max", dt_max)
-    _positive("t_max", t_max)
-    if log_every is not None:
-        _positive("log_every", log_every)
-    m_start = lander.dry_mass + s.fuel
-    dv_ideal = math.hypot(s.vx, s.vy)
-    steps = 0
-    log = []
-    next_log = s.t
-    deadline = s.t + t_max
+    s = State(s0.x, s0.y, s0.vx, s0.vy, s0.fuel, s0.t)
+    r0 = math.hypot(s.x, s.y)
+    tdyn_surface = body.dynamical_time(body.radius)
+    dt_max = dt_max or max(1e-3 * tdyn_surface, 1e-3)       # ~1 s at the Moon
+    dt_min = 1e-3                                           # s, absolute floor
+    t_max = t_max or 20.0 * body.dynamical_time(r0)
+    m_start = lander.empty_mass + s.fuel
+    v0 = math.hypot(s.vx, s.vy)
+    dv_ideal = v0                                           # speed to cancel (surface at rest)
+    log, next_log, steps = [], 0.0, 0
+    peak_a = 0.0
+
     while True:
         r = math.hypot(s.x, s.y)
         h = r - body.radius
         vr = (s.vx * s.x + s.vy * s.y) / r
         vh = (-s.vx * s.y + s.vy * s.x) / r
-        if log_every is not None and s.t >= next_log:
+        m = lander.empty_mass + s.fuel
+        dv_used = tsiolkovsky_dv(lander.isp, m_start, m)
+
+        if log_every and s.t >= next_log:
             log.append((s.t, h, vr, vh, s.fuel))
             next_log += log_every
-        if h <= 0:
-            outcome = "LANDED" if -vr <= crit.max_vertical and abs(vh) <= crit.max_horizontal else "CRASHED"
-            reason = "touchdown within limits" if outcome == "LANDED" else "touchdown speed exceeds limits"
-            break
-        if s.t >= deadline:
-            outcome, reason = "TIMEOUT", "maximum simulation time reached"
-            break
-        dt = min(dt_max, 0.01 * body.dynamical_time(r),
-                 0.02 * h / max(math.hypot(s.vx, s.vy), 1e-9))
-        dt = min(max(dt, dt_min), deadline - s.t)
+
+        if h <= 0.0:
+            vv, vhh = -vr, abs(vh)
+            if vv <= crit.max_vertical and vhh <= crit.max_horizontal:
+                outcome, reason = "LANDED", "within limits"
+            else:
+                bad = []
+                if vv > crit.max_vertical:
+                    bad.append(f"vertical {vv:.2f} > {crit.max_vertical:.2f}")
+                if vhh > crit.max_horizontal:
+                    bad.append(f"horizontal {vhh:.2f} > {crit.max_horizontal:.2f}")
+                outcome, reason = "CRASHED", "; ".join(bad)
+                if s.fuel <= 0:
+                    reason += " (out of fuel)"
+            return Result(outcome, reason, s.t, vv, vhh, s.fuel, dv_used, dv_ideal, steps, log, peak_g=peak_a / G0)
+        if s.t > t_max:
+            return Result("TIMEOUT", "never reached surface", s.t, -vr, abs(vh),
+                          s.fuel, dv_used, dv_ideal, steps, log, peak_g=peak_a / G0)
+
+        speed = math.hypot(s.vx, s.vy)
+        dt = min(dt_max, 0.01 * body.dynamical_time(r), 0.02 * h / max(speed, 1e-9))
+        dt = max(dt, dt_min)
         throttle, ux, uy = guidance.command(s, body, lander, crit)
+        if throttle > 0.0 and s.fuel > 0.0:
+            # While firing, one step must not change velocity by more than a fraction
+            # of the touchdown tolerance, or the controller can't resolve its own authority.
+            a_now = throttle * lander.thrust_max / m
+            dt = max(dt_min, min(dt, 0.25 * 0.5 * crit.max_vertical / a_now))
+        if s.fuel > 0:
+            peak_a = max(peak_a, throttle * lander.thrust_max / m)
         advance(s, body, lander, throttle, ux, uy, dt)
         steps += 1
-    return Result(outcome, reason, s.t, -vr, abs(vh), s.fuel,
-                  tsiolkovsky_dv(lander.isp, m_start, lander.dry_mass + s.fuel),
-                  dv_ideal, steps, log)
 
 
-@dataclass(frozen=True)
+# --------------------------------------------------------------------------
+# 4. Scenarios and the table
+# --------------------------------------------------------------------------
+@dataclass
 class Scenario:
     name: str
     body: Body
     lander: Lander
-    r_apo_alt: float
+    r_apo_alt: float                # m above surface
     r_peri_alt: float
     guidance: Guidance = field(default_factory=Guidance)
 
-    def __post_init__(self) -> None:
-        _positive("r_apo_alt", self.r_apo_alt, True)
-        _positive("r_peri_alt", self.r_peri_alt, True)
-        if self.r_apo_alt < self.r_peri_alt:
-            raise ValueError("apoapsis altitude must be at least periapsis altitude")
-
 
 SCENARIOS = [
-    Scenario("Moon", BODIES["moon"], Lander(7000, 8200, 45000, 311, 0.10),
-             100e3, 15e3, Guidance(tau_v=1.5, tau_h=3)),
-    Scenario("Ceres", BODIES["ceres"], Lander(1000, 500, 1500, 300, 0.10),
-             100e3, 10e3, Guidance(tau_v=3, tau_h=3)),
-    Scenario("67P", BODIES["67p"], Lander(90, 10, 5, 220),
-             7e3, 5e3, Guidance(tau_v=15, tau_h=15)),
+    Scenario("Moon / LM-like, 15x100 km", BODIES["moon"],
+             Lander(7000, 8200, 45_000, 311, 0.10), 100e3, 15e3,
+             Guidance(tau_v=1.5, tau_h=3)),
+    Scenario("Ceres / small lander, 10x100 km", BODIES["ceres"],
+             Lander(1000, 500, 1_500, 300, 0.10), 100e3, 10e3,
+             Guidance(tau_v=3, tau_h=3)),
+    Scenario("Comet 67P / micro lander, 5x7 km", BODIES["67p"],
+             Lander(90, 10, 5.0, 220, 0.0), 7e3, 5e3,
+             Guidance(tau_v=15, tau_h=15)),
 ]
 
 
-def run_scenario(sc: Scenario, **kw) -> tuple[dict[str, float | Criteria], Result]:
-    ra, rp = sc.body.radius + sc.r_apo_alt, sc.body.radius + sc.r_peri_alt
-    ideal = ideal_landing_dv(sc.body, ra, rp)
-    calc = dict(surface_g=sc.body.surface_g, v_escape=sc.body.escape_v,
-                v_peri=periapsis_speed(sc.body, ra, rp),
-                twr=thrust_to_weight(sc.body, sc.lander), dv_avail=sc.lander.delta_v,
-                dv_deorbit=deorbit_dv(sc.body, ra, rp), dv_ideal=ideal,
-                limits=Criteria.for_body(sc.body))
-    result = simulate_landing(sc.body, sc.lander,
-                              state_at_periapsis(sc.body, sc.lander, ra, rp),
-                              guidance=sc.guidance, **kw)
-    return calc, result
+def run_scenario(sc: Scenario, **kw) -> tuple[dict, Result]:
+    b, L = sc.body, sc.lander
+    r_apo, r_peri = b.radius + sc.r_apo_alt, b.radius + sc.r_peri_alt
+    s0 = state_at_periapsis(b, L, r_apo, r_peri)
+    res = simulate_landing(b, L, s0, sc.guidance, **kw)
+    calc = dict(
+        surface_g=b.surface_g, v_escape=b.escape_v,
+        v_peri=periapsis_speed(b, r_apo, r_peri),
+        dv_deorbit=deorbit_dv(b, r_apo, r_peri) if r_apo > r_peri else 0.0,
+        dv_ideal=ideal_landing_dv(b, r_apo, r_peri),
+        dv_avail=L.delta_v, twr=thrust_to_weight(b, L),
+        limits=Criteria.for_body(b),
+    )
+    return calc, res
 
 
-def print_table(scenarios: list[Scenario] = SCENARIOS) -> None:
-    rows = [(sc, *run_scenario(sc)) for sc in scenarios]
-    print("Analytic feasibility (SI units; delta-v and speeds in m/s)")
-    print(f"{'Scenario':<10} {'g':>9} {'Escape':>9} {'Periapsis':>10} {'Deorbit':>9} "
-          f"{'Ideal dv':>10} {'Avail dv':>10} {'TWR':>7} {'dv margin':>10}")
-    for sc, calc, result in rows:
-        print(f"{sc.name:<10} {calc['surface_g']:9.5f} {calc['v_escape']:9.2f} "
-              f"{calc['v_peri']:10.2f} {calc['dv_deorbit']:9.2f} {calc['dv_ideal']:10.2f} "
-              f"{calc['dv_avail']:10.2f} {calc['twr']:7.3f} "
-              f"{calc['dv_avail'] - calc['dv_ideal']:10.2f}")
-    print("\nSimulated landing (speeds in m/s; time in s; fuel in kg)")
-    print(f"{'Scenario':<10} {'Outcome':<9} {'Time':>9} {'Vertical':>9} {'Horiz':>9} "
-          f"{'V limit':>9} {'H limit':>9} {'dv used':>10} {'Grav loss':>10} {'Fuel left':>10}")
-    for sc, calc, result in rows:
-        limits = calc["limits"]
-        print(f"{sc.name:<10} {result.outcome:<9} {result.t:9.1f} {result.v_vert:9.3f} "
-              f"{result.v_horiz:9.3f} {limits.max_vertical:9.3f} {limits.max_horizontal:9.3f} "
-              f"{result.dv_used:10.2f} {result.gravity_loss:10.2f} {result.fuel_left:10.3f}")
-        if result.outcome != "LANDED":
-            print(f"  {result.reason}")
+def print_table(scenarios=SCENARIOS) -> None:
+    print("ANALYTIC CALCULATOR (closed form, no simulation)")
+    hdr = f"{'scenario':36} {'g_surf':>8} {'v_esc':>9} {'v_peri':>8} {'dv_ideal':>9} {'dv_avail':>9} {'TWR':>7} {'margin':>7}"
+    print(hdr)
+    rows = []
+    for sc in scenarios:
+        calc, res = run_scenario(sc)
+        rows.append((sc, calc, res))
+        margin = calc["dv_avail"] - calc["dv_ideal"]
+        print(f"{sc.name:36} {calc['surface_g']:8.4f} {calc['v_escape']:9.2f} "
+              f"{calc['v_peri']:8.1f} {calc['dv_ideal']:9.1f} {calc['dv_avail']:9.1f} "
+              f"{calc['twr']:7.2f} {margin:7.0f}")
+    print("\nSIMULATION vs LANDING WINDOW")
+    print(f"{'scenario':36} {'result':8} {'t(s)':>8} {'v_vert':>7} {'v_hor':>7} "
+          f"{'limit v/h':>11} {'dv_used':>8} {'g-loss':>7} {'fuel_left':>9}")
+    for sc, calc, res in rows:
+        lim = calc["limits"]
+        print(f"{sc.name:36} {res.outcome:8} {res.t:8.0f} {res.v_vert:7.2f} {res.v_horiz:7.2f} "
+              f"{lim.max_vertical:5.2f}/{lim.max_horizontal:4.2f} {res.dv_used:8.1f} "
+              f"{res.gravity_loss:7.1f} {res.fuel_left:9.1f}")
+        if res.outcome != "LANDED":
+            print(f"    -> {res.reason}")
 
 
 if __name__ == "__main__":
