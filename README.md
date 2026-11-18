@@ -41,6 +41,13 @@ and optional `log_every` seconds, and returns a `Result`. Log entries are
 `(t, altitude, radial_velocity, tangential_velocity, fuel)` tuples; radial
 velocity is positive outward, whereas `Result.v_vert` is positive downward.
 
+For player-directed maneuvers, create `PlayerControl(throttle, angle)` and call
+`advance_controlled(state, body, lander, control, dt)` one step at a time. Throttle
+is a fraction from 0 to 1; angle is in radians from current prograde (positive
+counterclockwise, so pi is retrograde). At rest, prograde falls back to the local
+counterclockwise tangent. Inspect the updated state and issue another command as
+needed; this API has no UI or automatic docking/landing guidance.
+
 The default guidance prioritizes vertical stopping and uses remaining thrust
 for orbital braking. Initial **surface** TWR below one is not an automatic
 failure: orbital motion initially supplies centrifugal support, and burning fuel
